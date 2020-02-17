@@ -1,1 +1,1 @@
-g++ main.cpp -o server && ./server
+g++ main.cpp && ./a.out
