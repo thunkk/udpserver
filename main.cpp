@@ -6,13 +6,14 @@
 #include <string.h>
 
 #include <unistd.h>
-
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 
 #include <list>
+#include <chrono>
 
 #pragma pack(push, 1)
 typedef struct {
@@ -51,10 +52,11 @@ typedef enum {
 typedef enum {
     LAST_VALUE   = 0,
     MEAN_LAST_10 = 1,
-    MEAN_ALL     = 2
+    MEAN_ALL     = 2,
+    COUNT_QUERY_TYPES
 }  QueryType;
 
-int create_udp_socket(int16_t port) noexcept {
+int create_udp_socket(int16_t port) {
     int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd < 0) {
         fprintf(stderr, "Socket (port %hd) creation failed, error code: %d\n", port, socket_fd);
@@ -73,8 +75,6 @@ int create_udp_socket(int16_t port) noexcept {
 }
 
 int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr *client_addr, socklen_t *client_length) {
-//     socklen_t clilen = 0;
-//     int length = recv(socket_fd, buffer, buffer_length, MSG_DONTWAIT);
     return recvfrom(socket_fd, buffer, buffer_length, MSG_DONTWAIT, client_addr, client_length);
 }
 
@@ -82,13 +82,16 @@ typedef struct {
     int8_t type;
     std::list<uint64_t> last_10; // TODO: honestly, this should just be a ring buffer
     int count;
+    // NOTE: mean may not give the same value as mean_last_10() even if there have been less than 11 values due to rounding errors
     double mean;
 } SensorData;
 
+const int count_sensors = 10;
 FILE *logfile;
-SensorData sensor_data[10] = {0};
+SensorData sensor_data[count_sensors] = {0};
 
 void log_sensor_packet(SensorPacket *packet) {
+    // TODO: std::chrono::system_clock for more precision?
     fprintf(logfile, "%ld,%d,%llu\n", time(NULL), packet->sensor, (long long) packet->data);
     fflush(logfile);
 }
@@ -146,54 +149,95 @@ void build_response(QueryPacket *query, SensorPacket *response) {
     }
 }
 
+bool valid_packet(SensorPacket *packet, int length) {
+    if (length != sizeof(SensorPacket)) return false;
+    if (packet->sensor > count_sensors) return false;
+    switch (packet->type) {
+        case FIELD_INT8: {
+            return packet->data <= 0x7F;
+        } break;
+        case FIELD_INT32: {
+            return packet->data <= 0x7FFFFFFFFF;
+        } break;
+        case FIELD_UINT64: {
+            return true;
+        } break;
+    }
+    return false;
+}
+
+bool valid_packet(QueryPacket *packet, int length) {
+    if (length != sizeof(QueryPacket)) return false;
+    if (packet->sensor > count_sensors) return false;
+    if (packet->query >= COUNT_QUERY_TYPES) return false;
+    return true;
+}
+
 int main() {
     int sensors  = create_udp_socket(12345),
         requests = create_udp_socket(12346);
 
     fd_set ports;
     int highest = (sensors > requests) ? sensors : requests;
+    highest += 1;
     timeval timeout = {0};
 
-    int const buffer_length = 100;
+    int buffer_length = 100;
     uint8_t  buffer[buffer_length] = {};
 
     logfile = fopen("sensors.csv", "a");
+
+    auto next_data_print_time = std::chrono::steady_clock::now();
+    next_data_print_time += std::chrono::seconds(1);
 
     while (true) {
         FD_ZERO(&ports);
         FD_SET(sensors, &ports);
         FD_SET(requests, &ports);
-        // Reset, select may modify timeout
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
+
+        auto current_time = std::chrono::steady_clock::now();
+        if (current_time > next_data_print_time) {
+            next_data_print_time += std::chrono::seconds(1);
+            for (int i = 0; i < count_sensors; i++) {
+                printf("Sensor %d: %f\n", i, mean_last_10(&sensor_data[i]));
+            }
+        }
+        auto diff = next_data_print_time - current_time;
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(diff);
+        auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(diff) - seconds;
+
+        timeout.tv_sec = seconds.count();
+        timeout.tv_usec = microseconds.count();
 
         select(highest, &ports, NULL, NULL, &timeout);
 
-        struct sockaddr client_addr;
-        socklen_t client_length = 0;
+        struct sockaddr_in client_addr = {0};
+        socklen_t client_length = sizeof(client_addr);
         if (FD_ISSET(sensors, &ports)) {
-            int length = read_socket(sensors, buffer, buffer_length, &client_addr, &client_length);
+            int length = read_socket(sensors, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_length);
+            SensorPacket *packet = (SensorPacket*) buffer;
 
-            if (length != sizeof(SensorPacket)) {
+            if (!valid_packet(packet, length)) {
                 fprintf(stderr, "Malformed packet from sensors\n");
             } else {
-                log_sensor_packet((SensorPacket*) buffer);
-                process_sensor((SensorPacket*) buffer);
+                log_sensor_packet(packet);
+                process_sensor(packet);
             }
-        } else if (FD_ISSET(requests, &ports)) {
-            int length = read_socket(requests, buffer, buffer_length, &client_addr, &client_length);
-            if (length != sizeof(QueryPacket)) {
+        }
+        if (FD_ISSET(requests, &ports)) {
+            int length = read_socket(requests, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_length);
+            QueryPacket *packet = (QueryPacket*) buffer;
+
+            if (!valid_packet(packet, length)) {
                 fprintf(stderr, "Malformed data request\n");
             } else {
+                printf("type %d\n", packet->query);
                 SensorPacket response = {0};
-                build_response((QueryPacket*) buffer, &response);
-                sendto(requests, &response, sizeof(SensorPacket), MSG_NOSIGNAL | MSG_CONFIRM, &client_addr, client_length);
+                build_response(packet, &response);
+                if (sendto(requests, &response, sizeof(SensorPacket), 0, (struct sockaddr*) &client_addr, client_length) < 0) {
+                    fprintf(stderr, "Sending failed, errno: %d\n", errno);
+                }
             }
-        } else {
-            SensorPacket packet;
-            packet.double_data = 1.1;
-            printf("double data %llx\n", packet.data);
-            printf("timeout %f %f\n", mean_last_10(&sensor_data[0]), sensor_data[0].mean);
         }
     }
     return 0;
