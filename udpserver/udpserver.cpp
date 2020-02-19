@@ -1,19 +1,52 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cstdint>
-
-#include <time.h>
-#include <string.h>
-
-#include <unistd.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <time.h>
+#include <string.h>
+#include <list>
+#include <chrono>
+
+#ifdef _MSC_VER
+#pragma comment (lib, "Ws2_32.lib")
+#pragma warning(disable:4996)
+#include <winsock2.h>
+typedef short socklen_t;
+
+void initSocketLib() {
+    WSADATA wsaData;
+    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (iResult != 0) {
+        printf("WSAStartup failed with error: %d\n", iResult);
+        exit(1);
+    }
+}
+
+inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_length) {
+    return recvfrom(socket_fd, (char*) buffer, buffer_length, 0, client_addr, (int*) client_length);
+}
+
+inline int reply_to(int sockfd, const void* buf, size_t len, const struct sockaddr* dest_addr, socklen_t addrlen) {
+    return sendto(sockfd, (char*)buf, len, 0, dest_addr, addrlen);
+}
+#else 
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 
-#include <list>
-#include <chrono>
+void initSocketLib() {
+}
+
+inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_length) {
+    return recvfrom(socket_fd, buffer, buffer_length, MSG_DONTWAIT, client_addr, client_length);
+}
+
+inline int reply_to(int sockfd, const void* buf, size_t len, const struct sockaddr* dest_addr, socklen_t addrlen) {
+    return sendto(sockfd, buf, len, MSG_CONFIRM, dest_addr, addrlen);
+}
+#endif
 
 #pragma pack(push, 1)
 typedef struct {
@@ -72,10 +105,6 @@ int create_udp_socket(int16_t port) {
         exit(-2);
     }
     return socket_fd;
-}
-
-int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr *client_addr, socklen_t *client_length) {
-    return recvfrom(socket_fd, buffer, buffer_length, MSG_DONTWAIT, client_addr, client_length);
 }
 
 typedef struct {
@@ -174,6 +203,7 @@ bool valid_packet(QueryPacket *packet, int length) {
 }
 
 int main() {
+    initSocketLib();
     int sensors  = create_udp_socket(12345),
         requests = create_udp_socket(12346);
 
@@ -182,8 +212,8 @@ int main() {
     highest += 1;
     timeval timeout = {0};
 
-    int buffer_length = 100;
-    uint8_t  buffer[buffer_length] = {};
+    const int buffer_length = 100;
+    uint8_t buffer[buffer_length] = {};
 
     logfile = fopen("sensors.csv", "a");
 
@@ -201,6 +231,7 @@ int main() {
             for (int i = 0; i < count_sensors; i++) {
                 printf("Sensor %d: %f\n", i, mean_last_10(&sensor_data[i]));
             }
+            fflush(stdout);
         }
         auto diff = next_data_print_time - current_time;
         auto seconds = std::chrono::duration_cast<std::chrono::seconds>(diff);
@@ -231,10 +262,9 @@ int main() {
             if (!valid_packet(packet, length)) {
                 fprintf(stderr, "Malformed data request\n");
             } else {
-                printf("type %d\n", packet->query);
                 SensorPacket response = {0};
                 build_response(packet, &response);
-                if (sendto(requests, &response, sizeof(SensorPacket), 0, (struct sockaddr*) &client_addr, client_length) < 0) {
+                if (reply_to(requests, &response, sizeof(SensorPacket), (struct sockaddr*) &client_addr, client_length) < 0) {
                     fprintf(stderr, "Sending failed, errno: %d\n", errno);
                 }
             }

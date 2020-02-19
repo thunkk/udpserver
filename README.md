@@ -1,3 +1,7 @@
+On windows use Visual Studio to compile, for linux there is a makefile.
+Binaries will be in the x64 folder.
+
+ORIGINAL TASK:
 *   General requirements  
     *   Have to compile and run on Linux (and Windows)
     *   Solution in git
