@@ -1,4 +1,4 @@
-On windows use Visual Studio to compile, for linux there is a makefile.
+On windows use Visual Studio to compile, for Linux there is a makefile.
 Binaries will be in the x64 folder.
 
 ORIGINAL TASK:
