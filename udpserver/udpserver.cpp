@@ -23,8 +23,8 @@ void initSocketLib() {
     }
 }
 
-inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_length) {
-    return recvfrom(socket_fd, (char*) buffer, buffer_length, 0, client_addr, (int*) client_length);
+inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_addr_length) {
+    return recvfrom(socket_fd, (char*) buffer, buffer_length, 0, client_addr, (int*) client_addr_length);
 }
 
 inline int reply_to(int sockfd, const void* buf, size_t len, const struct sockaddr* dest_addr, socklen_t addrlen) {
@@ -39,8 +39,8 @@ inline int reply_to(int sockfd, const void* buf, size_t len, const struct sockad
 void initSocketLib() {
 }
 
-inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_length) {
-    return recvfrom(socket_fd, buffer, buffer_length, MSG_DONTWAIT, client_addr, client_length);
+inline int read_socket(int socket_fd, void* buffer, int buffer_length, struct sockaddr* client_addr, socklen_t* client_addr_length) {
+    return recvfrom(socket_fd, buffer, buffer_length, MSG_DONTWAIT, client_addr, client_addr_length);
 }
 
 inline int reply_to(int sockfd, const void* buf, size_t len, const struct sockaddr* dest_addr, socklen_t addrlen) {
@@ -207,9 +207,9 @@ int main() {
     int sensors  = create_udp_socket(12345),
         requests = create_udp_socket(12346);
 
-    fd_set ports;
-    int highest = (sensors > requests) ? sensors : requests;
-    highest += 1;
+    fd_set sockets;
+    int max_descriptor = (sensors > requests) ? sensors : requests;
+    max_descriptor += 1;
     timeval timeout = {0};
 
     const int buffer_length = 100;
@@ -221,9 +221,9 @@ int main() {
     next_data_print_time += std::chrono::seconds(1);
 
     while (true) {
-        FD_ZERO(&ports);
-        FD_SET(sensors, &ports);
-        FD_SET(requests, &ports);
+        FD_ZERO(&sockets);
+        FD_SET(sensors, &sockets);
+        FD_SET(requests, &sockets);
 
         auto current_time = std::chrono::steady_clock::now();
         if (current_time > next_data_print_time) {
@@ -240,12 +240,12 @@ int main() {
         timeout.tv_sec = seconds.count();
         timeout.tv_usec = microseconds.count();
 
-        select(highest, &ports, NULL, NULL, &timeout);
+        select(max_descriptor, &sockets, NULL, NULL, &timeout);
 
         struct sockaddr_in client_addr = {0};
-        socklen_t client_length = sizeof(client_addr);
-        if (FD_ISSET(sensors, &ports)) {
-            int length = read_socket(sensors, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_length);
+        socklen_t client_addr_length = sizeof(client_addr);
+        if (FD_ISSET(sensors, &sockets)) {
+            int length = read_socket(sensors, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_addr_length);
             SensorPacket *packet = (SensorPacket*) buffer;
 
             if (!valid_packet(packet, length)) {
@@ -255,8 +255,8 @@ int main() {
                 process_sensor(packet);
             }
         }
-        if (FD_ISSET(requests, &ports)) {
-            int length = read_socket(requests, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_length);
+        if (FD_ISSET(requests, &sockets)) {
+            int length = read_socket(requests, buffer, buffer_length, (struct sockaddr*) &client_addr, &client_addr_length);
             QueryPacket *packet = (QueryPacket*) buffer;
 
             if (!valid_packet(packet, length)) {
@@ -264,7 +264,7 @@ int main() {
             } else {
                 SensorPacket response = {0};
                 build_response(packet, &response);
-                if (reply_to(requests, &response, sizeof(SensorPacket), (struct sockaddr*) &client_addr, client_length) < 0) {
+                if (reply_to(requests, &response, sizeof(SensorPacket), (struct sockaddr*) &client_addr, client_addr_length) < 0) {
                     fprintf(stderr, "Sending failed, errno: %d\n", errno);
                 }
             }
